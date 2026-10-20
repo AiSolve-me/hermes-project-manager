@@ -11,6 +11,16 @@ Both interfaces are separate delivery artifacts. They share one Python backend r
 - **`desktop/plugin.js`** — a standalone, uncompiled ESM disk plugin. It imports
   only the Hermes Desktop SDK and React; there is no npm build.
 
+## Screenshots
+
+The Dashboard **Projects** tab: the watched folders that drive discovery, then
+a searchable, paginated card list with per-project git controls.
+
+![Project Manager dashboard — watched folders and the project list](docs/assets/projects-dashboard.png)
+
+The Desktop interface is a native full-page view registered at `/projects`, with
+a `Projects` sidebar item — it speaks the same REST router.
+
 ## Requirements
 
 - Hermes Agent with Hermes Dashboard or Hermes Desktop.
@@ -304,6 +314,7 @@ desktop/
   plugin.single.mjs       loader-contract + render harness
   test_working_tree.mjs   behavioural harness (confirm gate, success:false, diff states)
   test_api_paths.py       routes, namespace, path anchoring
+docs/assets/              screenshots
 ```
 
 ## Tests
