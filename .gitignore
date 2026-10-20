@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local plugin state — never committed
+*.db
+*.db-shm
+*.db-wal
+
+.DS_Store
+node_modules/

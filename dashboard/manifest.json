@@ -1,0 +1,15 @@
+{
+  "name": "project-manager",
+  "label": "Projects",
+  "description": "Git project overview — branches, commits, remotes, and sync status",
+  "icon": "Code",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/projects",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py",
+  "has_api": true
+}

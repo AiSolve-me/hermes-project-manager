@@ -1,0 +1,13 @@
+manifest_version: 1
+name: project-manager
+version: 1.0.0
+description: "Git workbench — discover repositories under the folders you watch, and inspect or change them per file (stage, unstage, diff, discard) from the Hermes dashboard or Desktop."
+author: AiSolve.me
+homepage: "https://github.com/AiSolve-me/hermes-project-manager"
+license: MIT
+provides_tools:
+  - list_projects
+  - get_project
+  - list_branches
+  - get_recent_commits
+  - list_watch_paths

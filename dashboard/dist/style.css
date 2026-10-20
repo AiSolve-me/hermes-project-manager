@@ -1,0 +1,111 @@
+/* Project Manager Plugin Styles */
+.pm-plugin {
+  box-sizing: border-box;
+}
+
+.pm-plugin * {
+  box-sizing: inherit;
+}
+
+.pm-plugin .pm-container {
+  padding: 1rem;
+}
+
+.pm-plugin .pm-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin-bottom: 0.75rem;
+  background: var(--color-card);
+}
+
+.pm-plugin .pm-card:hover {
+  border-color: var(--color-ring);
+}
+
+.pm-plugin .pm-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.pm-plugin .pm-card-title {
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+.pm-plugin .pm-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius);
+  font-size: 0.75rem;
+  font-weight: 500;
+  background: var(--color-secondary);
+  color: var(--color-secondary-foreground);
+}
+
+.pm-plugin .pm-dirty {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-destructive);
+  display: inline-block;
+  margin-left: 0.5rem;
+}
+
+.pm-plugin .pm-clean {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-success);
+  display: inline-block;
+  margin-left: 0.5rem;
+}
+
+.pm-plugin .pm-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.pm-plugin .pm-list-item {
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.pm-plugin .pm-list-item:last-child {
+  border-bottom: none;
+}
+
+.pm-plugin .pm-meta {
+  font-size: 0.8rem;
+  color: var(--color-muted-foreground);
+  margin-top: 0.25rem;
+}
+
+.pm-plugin .pm-link {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+.pm-plugin .pm-link:hover {
+  text-decoration: underline;
+}
+
+/* Responsive styles for mobile */
+@media (max-width: 768px) {
+  .pm-plugin .pm-card-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .pm-plugin .pm-card-title {
+    font-size: 1rem;
+  }
+
+  .pm-plugin .pm-container {
+    padding: 0.5rem;
+  }
+}
