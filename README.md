@@ -48,7 +48,21 @@ set `HERMES_HOME="$HOME/.hermes/profiles/<name>"` for the copy commands below.
 hermes plugins install AiSolve-me/hermes-project-manager --enable
 ```
 
-This installs and enables the shared backend plus the Dashboard interface.
+Then restart the running Hermes process so the plugin's tools are discovered.
+For the gateway:
+
+```bash
+hermes gateway restart
+```
+
+If the directory already exists and you intentionally want to replace it:
+
+```bash
+hermes plugins install AiSolve-me/hermes-project-manager --enable --force
+```
+
+`--force` deletes the existing plugin directory before reinstalling, so back up
+any plugin-local changes first.
 
 To enable the Hermes Desktop interface, copy the disk plugin to
 `$HERMES_HOME/desktop-plugins/project-manager/plugin.js`:
@@ -63,22 +77,54 @@ cp "$HERMES_HOME/plugins/project-manager/desktop/plugin.js" \
 Hermes Desktop inventories the UI separately under **Settings → Plugins**;
 enable `Projects` there if it is disabled.
 
-### Update an existing installation
+### Updating
+
+Installed with the Hermes plugin command:
 
 ```bash
 hermes plugins update project-manager
+hermes gateway restart
+```
+
+For a clean reinstall from GitHub instead of a pull into the existing directory:
+
+```bash
+hermes plugins install AiSolve-me/hermes-project-manager --enable --force
+hermes gateway restart
+```
+
+Installed or developed as a manual git clone:
+
+```bash
+cd ~/.hermes/plugins/project-manager
+git pull --ff-only
+hermes gateway restart
+```
+
+Use the `git pull` path when you want to keep a normal local checkout; use
+`hermes plugins install --force` when you want Hermes to replace the plugin
+directory from the remote.
+
+After either path, refresh the Desktop half too — it is a separate copy:
+
+```bash
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/desktop-plugins/project-manager"
 cp "$HERMES_HOME/plugins/project-manager/desktop/plugin.js" \
   "$HERMES_HOME/desktop-plugins/project-manager/plugin.js"
 ```
 
-The second copy step is required because Dashboard/general plugins and Desktop
-disk plugins use separate delivery directories.
-
 ### Install from a local checkout
 
-From this repository directory:
+Manual clone, for development:
+
+```bash
+git clone https://github.com/AiSolve-me/hermes-project-manager \
+  ~/.hermes/plugins/project-manager
+hermes plugins enable project-manager
+hermes gateway restart
+```
+
+Or copy the tree from an existing checkout:
 
 ```bash
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
@@ -89,7 +135,9 @@ mkdir -p "$HERMES_HOME/desktop-plugins/project-manager"
 cp desktop/plugin.js "$HERMES_HOME/desktop-plugins/project-manager/plugin.js"
 ```
 
-Then `hermes plugins enable project-manager` and restart Hermes.
+Both interfaces are enabled **separately**: the package must be in
+`plugins.enabled` so Hermes mounts `dashboard/plugin_api.py`, and copying only
+the Desktop disk plugin is not sufficient.
 
 ### Standalone server
 
