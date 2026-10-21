@@ -718,6 +718,43 @@ def git_stash(path: str | Path, include_untracked: bool = True) -> dict:
         }
 
 
+def _valid_remote(path: str | Path, remote: str) -> bool:
+    """True when *remote* is safe to pass to git as a positional.
+
+    A caller-supplied remote must never reach ``git fetch`` / ``git push`` as a
+    positional: git parses a leading-dash argument as an OPTION, and
+    ``git fetch --upload-pack=<cmd> .`` executes ``<cmd>`` locally. Rejecting
+    the leading dash closes that.
+
+    An unknown-but-harmless name ("upstream" when there is none) is NOT
+    rejected here: git reports it with its own ordinary error, and passing it
+    through keeps that message intact for the client. The security boundary is
+    the dash, not the membership test.
+    """
+    return bool(remote) and not remote.startswith("-")
+
+
+def _valid_branch(branch: str) -> bool:
+    """True when *branch* is a safe ref name.
+
+    Same positional-argument hazard as :func:`_valid_remote`, so defer to
+    git's own parser rather than hand-rolling rules it might disagree with.
+    """
+    if not branch or branch.startswith("-"):
+        return False
+    try:
+        checked = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return checked.returncode == 0
+
+
 def git_push(path: str | Path, remote: str = "origin", branch: str | None = None) -> dict:
     """
     Push the current branch (or *branch*) to *remote*.
@@ -739,6 +776,15 @@ def git_push(path: str | Path, remote: str = "origin", branch: str | None = None
         ``message`` (str), ``stderr`` (str).
     """
     path_str = str(path)
+    # Validate BEFORE anything reaches the argv: a caller-supplied remote or
+    # branch passed positionally is parsed by git as an option, and
+    # --upload-pack / --receive-pack execute a command locally.
+    if not _valid_remote(path_str, remote):
+        return {
+            "success": False,
+            "message": f"push rejected: unknown remote {remote!r}",
+            "stderr": "",
+        }
     if branch is None:
         try:
             head = subprocess.run(
@@ -760,6 +806,13 @@ def git_push(path: str | Path, remote: str = "origin", branch: str | None = None
                 "message": f"could not resolve current branch: {exc}",
                 "stderr": stderr_text.strip(),
             }
+
+    if not _valid_branch(branch):
+        return {
+            "success": False,
+            "message": f"push rejected: invalid branch name {branch!r}",
+            "stderr": "",
+        }
 
     try:
         result = subprocess.run(

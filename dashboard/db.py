@@ -23,7 +23,27 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
-_DB_PATH = Path(__file__).resolve().parent / "project-manager.db"
+def _default_db_path() -> Path:
+    """Where the SQLite file lives.
+
+    NOT in the plugin directory: a reinstall replaces that folder wholesale and
+    the user's watch paths would go with it. Plugin state belongs under
+    ``$HERMES_HOME/plugin-data/``, which survives. Falls back to the plugin dir
+    when there is no HERMES_HOME (a bare checkout run by hand), so nothing
+    breaks.
+    """
+    override = os.environ.get("PROJECT_MANAGER_DB")
+    if override:
+        return Path(override).expanduser()
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        target = Path(home).expanduser() / "plugin-data" / "project-manager"
+        target.mkdir(parents=True, exist_ok=True)
+        return target / "project-manager.db"
+    return Path(__file__).resolve().parent / "project-manager.db"
+
+
+_DB_PATH = _default_db_path()
 
 _pool_instance: Optional[ConnectionPool] = None
 _pool_lock = threading.Lock()

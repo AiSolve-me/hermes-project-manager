@@ -417,9 +417,31 @@ await act(async () => {
 check('selecting a project renders the inlined working-tree panel', () => {
   const text = container.textContent
 
-  assert.ok(text.includes('Working tree — tiboo00-hermes'), 'working tree section missing')
-  assert.ok(text.includes('plugins/project-manager/desktop/working-tree.js'), 'modified file row missing')
-  assert.ok(text.includes('plugins/project-manager/desktop/plugin.single.mjs'), 'untracked file row missing')
+  // The panel renders INSIDE the clicked card, so the project name is already
+  // on screen above it — the old standalone "Working tree — <name>" heading is
+  // gone, and the file rows are what proves the panel mounted.
+  assert.ok(
+    text.includes('plugins/project-manager/desktop/working-tree.js'),
+    'modified file row missing'
+  )
+  assert.ok(
+    text.includes('plugins/project-manager/desktop/plugin.single.mjs'),
+    'untracked file row missing'
+  )
+  // And it must be attached to THAT card, not floating at the bottom of the
+  // list: the detail container sits inside the card wrapper.
+  const card = container.querySelector('[data-card="tiboo00-hermes"]')
+  assert.ok(card, 'the selected project has no card')
+  assert.ok(
+    card.querySelector('[data-detail="tiboo00-hermes"]'),
+    'the panel is not inside the clicked card'
+  )
+  // Only the selected card carries a detail section.
+  assert.equal(
+    container.querySelectorAll('[data-detail]').length,
+    1,
+    'more than one card shows a working tree'
+  )
 })
 
 check('the panel queried git-status through the REST door', () => {

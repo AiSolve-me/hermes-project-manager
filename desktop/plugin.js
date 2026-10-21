@@ -70,6 +70,118 @@ const fileOp = (name, action, file) =>
 const gitFetch = (name, remote = 'origin') =>
   door()(`${proj(name)}/git/fetch`, { method: 'POST', body: { remote } })
 
+// The card's Pull/Commit buttons. Pull takes no body — the helper resolves
+// the upstream branch itself.
+const gitPull = name =>
+  door()(`${proj(name)}/git-pull`, { method: 'POST', body: {} })
+
+const gitCommit = (name, message) =>
+  door()(`${proj(name)}/git-commit`, {
+    method: 'POST',
+    body: { message, commit_and_push: false }
+  })
+
+const gitPush = (name, remote = 'origin', branch = null) =>
+  door()(`${proj(name)}/git-push`, { method: 'POST', body: { remote, branch } })
+
+// No body — the route takes none and stashes untracked files too, exactly
+// what the web's "Stash all" button sends.
+const gitStash = name => door()(`${proj(name)}/git-stash`, { method: 'POST', body: {} })
+
+// ── Watch paths + bulk pull ────────────────────────────────────────────────
+// The Desktop surface had no way to add a watch folder, which is where the
+// project list comes from in the first place. These are the same routes the
+// web dashboard uses.
+const fetchWatchPaths = () => door()('/watch-paths')
+
+const addWatchPath = (path, type, label) =>
+  door()('/watch-paths', { method: 'POST', body: label ? { path, type, label } : { path, type } })
+
+const deleteWatchPath = id => door()(`/watch-paths/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
+/** Body is {label} — RenameRequest has exactly that one field. An empty label
+ *  is a 400, so an emptied input must not be sent. */
+const renameWatchPath = (id, label) =>
+  door()(`/watch-paths/${encodeURIComponent(id)}`, { method: 'PATCH', body: { label } })
+
+/** Body is {ids: number[]} — the FULL new order; sort_order is the row index. */
+const reorderWatchPaths = ids => door()('/watch-paths/reorder', { method: 'POST', body: { ids } })
+
+/** Server refuses a prefix under 2 chars (400), so the caller filters first. */
+const suggestWatchPaths = prefix =>
+  door()(`/watch-paths/suggest?prefix=${encodeURIComponent(prefix)}`)
+
+const pullAll = () => door()('/projects/pull-all', { method: 'POST', body: {} })
+
+// ── Branches, commits, worktrees ───────────────────────────────────────────
+// Read-only project views the web card shows and Desktop never fetched.
+// /branches answers a bare BranchItem[] ({name, is_current}); /commits
+// answers {commits: CommitItem[]} ({hash, message, date, author}).
+const fetchBranches = name => door()(`${proj(name)}/branches`)
+
+const fetchCommits = name => door()(`${proj(name)}/commits`)
+
+// The worktree routes are a DIFFERENT contract from the git/* ones: success is
+// HTTP 200 with {worktrees, current_worktree_id}, and every refusal is a 4xx/5xx
+// {error, code} — there is no success:false to inspect. `code` is the part the
+// UI acts on (WORKTREE_DIRTY / WORKTREE_LOCKED / WORKTREE_PROTECTED / …).
+const wtPath = name => `${proj(name)}/worktrees`
+
+const fetchWorktrees = name => door()(wtPath(name))
+
+/** {branches: [{name, is_current, is_remote, upstream}], current_branch} —
+ *  the branches of the ACTIVE worktree, which is what the picker checks out in. */
+const fetchWorktreeBranches = name => door()(`${wtPath(name)}/branches`)
+
+const selectWorktree = (name, worktreeId) =>
+  door()(`${wtPath(name)}/${encodeURIComponent(worktreeId)}/select`, { method: 'POST', body: {} })
+
+/** BranchCheckoutRequest models exactly {branch, stash, force}; the flags are
+ *  only sent when chosen so a plain checkout stays a plain checkout. */
+const checkoutBranch = (name, branch, { stash = false, force = false } = {}) =>
+  door()(`${wtPath(name)}/checkout`, {
+    method: 'POST',
+    body: stash ? { branch, stash: true } : force ? { branch, force: true } : { branch }
+  })
+
+/** WorktreeDeleteRequest is {force} and force ONLY overrides WORKTREE_DIRTY —
+ *  current / locked / protected are refused either way. */
+const deleteWorktree = (name, worktreeId, force) =>
+  door()(`${wtPath(name)}/${encodeURIComponent(worktreeId)}`, {
+    method: 'DELETE',
+    body: { force: !!force }
+  })
+
+const deleteAllWorktrees = (name, force) =>
+  door()(wtPath(name), { method: 'DELETE', body: { force: !!force } })
+
+/** The worktree routes answer `{error, code}` and the REST door re-throws them
+ *  as `404: {json}` — the code is the actionable half (which protection fired),
+ *  so both are surfaced instead of the bare message. */
+function wtError(err) {
+  const raw = err instanceof Error ? err.message : String(err ?? '')
+  const brace = raw.indexOf('{')
+
+  if (brace !== -1) {
+    try {
+      const body = JSON.parse(raw.slice(brace))
+
+      return { code: body.code || null, text: body.error || body.detail || body.message || raw }
+    } catch {
+      // Not JSON — fall through to the raw message.
+    }
+  }
+
+  return { code: null, text: raw }
+}
+
+/** `${code}: ${text}` when the server named a code, else the message alone. */
+const wtErrorText = err => {
+  const { code, text } = wtError(err)
+
+  return code ? `${code}: ${text}` : text
+}
+
 
 // ── [2] WORKING-TREE PANEL (from working-tree.js) ──────────────────────────
 // Per-file git surface: the stage / unstage / discard / diff feature set the
@@ -265,6 +377,546 @@ function DiffOverlay({ diff, onClose }) {
   )
 }
 
+/** The web's ProjectCard folds its extra blocks behind a header row. One
+ *  disclosure shape for all three so they behave identically. */
+function Disclosure({ label, count, children, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen)
+
+  return createElement(
+    'section',
+    { className: 'border-t border-border pt-2' },
+    createElement(
+      'button',
+      {
+        type: 'button',
+        'aria-expanded': open,
+        className: 'flex w-full items-center justify-between gap-2 text-left text-xs font-medium text-muted-foreground hover:text-foreground',
+        onClick: () => setOpen(prev => !prev)
+      },
+      label,
+      createElement(
+        'span',
+        { className: 'flex items-center gap-1 text-[11px]' },
+        count === undefined || count === null ? null : createElement(Badge, { size: 'xs', variant: 'muted' }, String(count)),
+        open ? '▾' : '▸'
+      )
+    ),
+    open ? children : null
+  )
+}
+
+/** Read-only /branches — the web card shows this list next to the commits.
+ *  No checkout here: the branch switch lives in the worktree block below,
+ *  which owns the dirty/stash decision. */
+function ProjectBranches({ projectName }) {
+  const { data, error, isPending } = useQuery({
+    enabled: !!projectName,
+    queryFn: () => fetchBranches(projectName),
+    queryKey: [...PM_QUERY_ROOT, 'branches', projectName],
+    staleTime: 30_000
+  })
+
+  // The route answers a BARE list, not {branches: …}.
+  const branches = Array.isArray(data) ? data : []
+
+  return createElement(
+    Disclosure,
+    { count: branches.length, label: 'Branches' },
+    error
+      ? createElement('p', { className: 'text-xs text-destructive' }, errorText(error))
+      : isPending
+        ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'Reading branches…')
+        : branches.length === 0
+          ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'No local branches.')
+          : createElement(
+              'ul',
+              { className: 'max-h-40 space-y-0.5 overflow-y-auto text-xs' },
+              branches.map(branch =>
+                createElement(
+                  'li',
+                  { key: branch.name, className: 'flex items-center gap-1.5' },
+                  createElement(Codicon, { name: 'source-control', size: '0.8em' }),
+                  createElement('span', { className: 'truncate' }, branch.name),
+                  branch.is_current ? createElement(Badge, { size: 'xs', variant: 'muted' }, 'current') : null
+                )
+              )
+            )
+  )
+}
+
+/** Read-only /commits — CommitListResponse is {commits: CommitItem[]}. */
+function ProjectCommits({ projectName }) {
+  const { data, error, isPending } = useQuery({
+    enabled: !!projectName,
+    queryFn: () => fetchCommits(projectName),
+    queryKey: [...PM_QUERY_ROOT, 'commits', projectName],
+    staleTime: 30_000
+  })
+
+  const commits = data?.commits ?? []
+
+  return createElement(
+    Disclosure,
+    { count: commits.length, label: 'Recent commits' },
+    error
+      ? createElement('p', { className: 'text-xs text-destructive' }, errorText(error))
+      : isPending
+        ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'Reading commits…')
+        : commits.length === 0
+          ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'No commits yet.')
+          : createElement(
+              'ul',
+              { className: 'max-h-48 space-y-0.5 overflow-y-auto text-xs' },
+              commits.map(commit => {
+                const age = relativeAge(commit.date)
+
+                return createElement(
+                  'li',
+                  { key: commit.hash, className: 'flex items-baseline gap-1.5', title: commit.message },
+                  createElement('code', { className: 'shrink-0 text-[10px] text-muted-foreground' }, String(commit.hash).slice(0, 7)),
+                  createElement('span', { className: 'min-w-0 flex-1 truncate' }, commit.message),
+                  createElement('span', { className: 'shrink-0 text-[10px] text-muted-foreground/70' }, `${commit.author}${age ? ` · ${age}` : ''}`)
+                )
+              })
+            )
+  )
+}
+
+/** The web's WorktreesSection, ported. Contract notes that shape this file:
+ *
+ *  - every route here REFUSES with 4xx/5xx `{error, code}` instead of the
+ *    `success:false` the git/* routes use, so refusals arrive as a throw and
+ *    `code` is what says WHICH protection fired;
+ *  - `is_current` / `is_locked` / `is_protected` are unremovable by ANY body,
+ *    and `is_dirty` is removable only with `force: true` — so the button says
+ *    so up front instead of firing a request the server will refuse;
+ *  - checkout refuses a dirty tree with WORKTREE_DIRTY, and the two ways past
+ *    it (stash / force) are a USER decision, so they are explicit buttons in
+ *    this file — never an automatic stash, and never window.confirm. */
+function WorktreesSection({ projectName, onChanged }) {
+  const client = useQueryClient()
+  const list = useQuery({
+    enabled: !!projectName,
+    queryFn: () => fetchWorktrees(projectName),
+    queryKey: [...PM_QUERY_ROOT, 'worktrees', projectName],
+    staleTime: 5_000
+  })
+  const branchesQuery = useQuery({
+    enabled: !!projectName,
+    queryFn: () => fetchWorktreeBranches(projectName),
+    queryKey: [...PM_QUERY_ROOT, 'worktree-branches', projectName],
+    staleTime: 5_000
+  })
+
+  const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null)
+  // Which row an op is in flight for — one row locks, not the whole list.
+  const [busyId, setBusyId] = useState(null)
+  const [armedDelete, setArmedDelete] = useState(null)
+  const [armedBulk, setArmedBulk] = useState(false)
+  const [bulkForce, setBulkForce] = useState(false)
+  const [target, setTarget] = useState('')
+  const [checkingOut, setCheckingOut] = useState(false)
+  // Set when the server answered WORKTREE_DIRTY: the branch is parked until the
+  // user picks stash / force / cancel. Nothing retries on its own.
+  const [dirtyChoice, setDirtyChoice] = useState(null)
+
+  const worktrees = list.data?.worktrees ?? []
+  const currentId = list.data?.current_worktree_id ?? null
+  const branches = branchesQuery.data?.branches ?? []
+  const currentBranch = branchesQuery.data?.current_branch ?? ''
+
+  // Everything a worktree op can move: the list, the active worktree's
+  // branches, and the project's own git state (the checkout switches branches).
+  const settle = useCallback(async () => {
+    try {
+      await refreshProjects()
+    } catch (err) {
+      setError(wtErrorText(err))
+
+      return
+    }
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'worktrees'] })
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'worktree-branches'] })
+    await client.invalidateQueries({ queryKey: gitStatusKey(projectName) })
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'branches'] })
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'commits'] })
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'projects'] })
+  }, [client, projectName])
+
+  const onSelect = useCallback(
+    async id => {
+      if (!id || busyId) return
+
+      setBusyId(id)
+      setError(null)
+      setNotice(null)
+
+      try {
+        // Empty body: WorktreeSelectRequest has no fields.
+        await selectWorktree(projectName, id)
+        setNotice('Active worktree switched.')
+        await settle()
+      } catch (err) {
+        setError(wtErrorText(err))
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [busyId, projectName, settle]
+  )
+
+  const runDelete = useCallback(
+    async (worktree, force) => {
+      setBusyId(worktree.id)
+      setError(null)
+      setNotice(null)
+
+      try {
+        // {force: true} is the ONLY thing that overrides WORKTREE_DIRTY — the
+        // other three protections refuse either way, which is why the button
+        // is disabled for them instead of being fired and caught.
+        await deleteWorktree(projectName, worktree.id, force)
+        setNotice(`Removed ${worktree.branch || worktree.path}.`)
+        await settle()
+      } catch (err) {
+        setError(wtErrorText(err))
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [projectName, settle]
+  )
+
+  const runBulkDelete = useCallback(
+    async force => {
+      setArmedBulk(false)
+      setError(null)
+      setNotice(null)
+      setBusyId('__bulk__')
+
+      try {
+        const result = await deleteAllWorktrees(projectName, force)
+        // The bulk route answers per-outcome, so all three parts are reported:
+        // a silent skip reads as "it worked" when a worktree is still there.
+        const skippedItems = Array.isArray(result?.skipped) ? result.skipped : []
+        const errorItems = Array.isArray(result?.errors) ? result.errors : []
+        const removed = result?.removed_ids?.length ?? 0
+
+        setNotice(
+          `Removed ${removed} worktree${removed === 1 ? '' : 's'}` +
+            (skippedItems.length
+              ? `, skipped ${skippedItems.length} (${skippedItems.map(item => item.reason).filter(Boolean).join(', ')})`
+              : '') +
+            (errorItems.length ? `, ${errorItems.length} failed` : '')
+        )
+        await settle()
+      } catch (err) {
+        setError(wtErrorText(err))
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [projectName, settle]
+  )
+
+  const doCheckout = useCallback(
+    async (branch, opts) => {
+      setCheckingOut(true)
+      setError(null)
+      setNotice(null)
+
+      try {
+        const result = await checkoutBranch(projectName, branch, opts)
+
+        setDirtyChoice(null)
+        setTarget('')
+        setNotice(
+          `Checked out ${result?.branch || branch}${result?.stashed ? ' (changes stashed)' : ''}.`
+        )
+        await settle()
+      } catch (err) {
+        const parsed = wtError(err)
+
+        // WORKTREE_DIRTY is a QUESTION, not a failure: hold the branch and let
+        // the user decide. Anything else is a real error and is shown as-is.
+        if (parsed.code === 'WORKTREE_DIRTY') {
+          setDirtyChoice({ branch, message: parsed.text })
+        } else {
+          setError(wtErrorText(err))
+        }
+      } finally {
+        setCheckingOut(false)
+      }
+    },
+    [projectName, settle]
+  )
+
+  const badges = worktree => {
+    const out = []
+
+    if (worktree.is_current) out.push(createElement(Badge, { key: 'cur', size: 'xs', variant: 'muted' }, 'current'))
+    if (worktree.is_locked) out.push(createElement(Badge, { key: 'lock', size: 'xs', variant: 'warn' }, worktree.lock_reason ? `locked: ${worktree.lock_reason}` : 'locked'))
+    if (worktree.is_dirty) out.push(createElement(Badge, { key: 'dirty', size: 'xs', variant: 'warn' }, 'dirty'))
+    if (worktree.is_protected) out.push(createElement(Badge, { key: 'prot', size: 'xs', variant: 'outline' }, 'protected'))
+    if (!worktree.branch) out.push(createElement(Badge, { key: 'det', size: 'xs', variant: 'outline' }, 'detached'))
+
+    return out
+  }
+
+  // Exactly the backend's order (current → locked → protected → dirty), so the
+  // title names the protection that would actually fire.
+  const removeRefusal = worktree => {
+    if (worktree.is_current) return "Cannot remove: this is the project's own worktree"
+    if (worktree.is_locked) return 'Cannot remove: worktree is locked'
+    if (worktree.is_protected) return `Cannot remove: protected branch '${worktree.branch || 'unknown'}'`
+    if (worktree.is_dirty) return 'Removing needs force: it has uncommitted changes'
+
+    return 'Remove this worktree'
+  }
+
+  const removable = worktree => !worktree.is_current && !worktree.is_locked && !worktree.is_protected
+
+  const rows = worktrees.map(worktree => {
+    const busy = busyId === worktree.id
+    const isCurrent = worktree.id === currentId
+
+    return createElement(
+      'li',
+      {
+        className: cn('flex items-center gap-1.5 rounded px-1 py-0.5', isCurrent && 'bg-accent/5'),
+        key: worktree.id
+      },
+      createElement(
+        'button',
+        {
+          type: 'button',
+          'aria-label': `Select worktree ${worktree.branch || worktree.path}`,
+          'aria-pressed': isCurrent,
+          className: cn('shrink-0 text-[11px] underline-offset-2', isCurrent ? 'text-muted-foreground/50' : 'hover:underline'),
+          disabled: isCurrent || !!busyId,
+          onClick: () => onSelect(worktree.id),
+          title: isCurrent ? 'Already the active worktree' : 'Make this the active worktree'
+        },
+        isCurrent ? '●' : '○'
+      ),
+      createElement('code', { className: 'min-w-0 flex-1 truncate', title: worktree.path }, worktree.branch || worktree.path),
+      createElement('span', { className: 'flex shrink-0 items-center gap-1' }, badges(worktree)),
+      createElement(
+        'button',
+        {
+          type: 'button',
+          className: 'shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[11px] text-destructive hover:bg-destructive/10',
+          disabled: !removable(worktree) || !!busyId,
+          onClick: () => setArmedDelete(worktree),
+          title: removeRefusal(worktree),
+          'aria-label': `Remove worktree ${worktree.branch || worktree.path}`
+        },
+        busy ? '…' : 'Remove'
+      )
+    )
+  })
+
+  const checkoutButton = (label, onClick, disabled) =>
+    createElement(
+      'button',
+      {
+        type: 'button',
+        className: 'shrink-0 rounded border border-[var(--ui-stroke-secondary)] px-2 py-0.5 text-xs hover:bg-accent/10 disabled:opacity-40',
+        disabled,
+        onClick
+      },
+      label
+    )
+
+  const dirtyWorktrees = worktrees.filter(worktree => removable(worktree) && worktree.is_dirty).length
+  const cleanRemovable = worktrees.filter(removable).length
+
+  return createElement(
+    Disclosure,
+    { count: worktrees.length, label: 'Worktrees & branches' },
+    createElement(
+      'div',
+      { className: 'mt-2 space-y-2' },
+
+      list.error
+        ? createElement('p', { className: 'text-xs text-destructive', role: 'alert' }, wtErrorText(list.error))
+        : null,
+      error ? createElement('p', { className: 'text-xs text-destructive', role: 'alert' }, error) : null,
+      notice ? createElement('p', { className: 'text-xs text-muted-foreground', role: 'status' }, notice) : null,
+
+      createElement(
+        'div',
+        { className: 'flex flex-wrap items-center gap-1.5' },
+        createElement('span', { className: 'text-xs font-medium' }, 'Worktrees'),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            className: 'rounded border border-[var(--ui-stroke-secondary)] px-2 py-0.5 text-xs hover:bg-accent/10',
+            onClick: () => list.refetch?.(),
+            title: 'Re-read the worktree list',
+            disabled: list.isFetching
+          },
+          list.isFetching ? 'Loading…' : 'Refresh'
+        ),
+        createElement(
+          'button',
+          {
+            type: 'button',
+            className: 'rounded border border-destructive/40 px-2 py-0.5 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40',
+            disabled: cleanRemovable === 0 && dirtyWorktrees === 0,
+            onClick: () => {
+              setBulkForce(false)
+              setArmedBulk(true)
+            },
+            title: 'Remove every non-current, non-locked, non-protected worktree'
+          },
+          busyId === '__bulk__' ? 'Removing…' : 'Delete all'
+        )
+      ),
+
+      list.isPending && !worktrees.length
+        ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'Reading worktrees…')
+        : worktrees.length === 0
+          ? createElement('p', { className: 'text-xs text-muted-foreground' }, 'No worktrees found.')
+          : createElement('ul', { className: 'max-h-56 space-y-0.5 overflow-y-auto text-xs' }, rows),
+
+      // ── branch checkout ────────────────────────────────────────────────
+      createElement(
+        'div',
+        { className: 'space-y-1.5 border-t border-border pt-2' },
+        createElement('div', { className: 'flex flex-wrap items-center gap-1.5' },
+          createElement('span', { className: 'text-xs font-medium' }, 'Branch'),
+          createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'rounded border border-[var(--ui-stroke-secondary)] px-2 py-0.5 text-xs hover:bg-accent/10',
+              disabled: branchesQuery.isFetching,
+              onClick: () => branchesQuery.refetch?.()
+            },
+            branchesQuery.isFetching ? 'Loading…' : 'Refresh'
+          ),
+          currentBranch ? createElement(Badge, { size: 'xs', variant: 'muted' }, currentBranch) : null
+        ),
+
+        branchesQuery.error
+          ? createElement('p', { className: 'text-xs text-destructive' }, wtErrorText(branchesQuery.error))
+          : null,
+
+        createElement(
+          'div',
+          { className: 'flex flex-wrap items-center gap-1.5' },
+          createElement(
+            'select',
+            {
+              'aria-label': `Branch to check out in ${projectName}`,
+              className: 'min-w-0 flex-1 rounded border border-[var(--ui-stroke-secondary)] bg-background px-2 py-1 text-xs outline-none focus:border-[var(--ui-stroke-focus)]',
+              disabled: checkingOut,
+              onChange: event => setTarget(event.target.value),
+              value: target
+            },
+            createElement('option', { value: '' }, branches.length ? 'Pick a local branch…' : 'No branches'),
+            branches.map(branch =>
+              createElement(
+                'option',
+                {
+                  // A remote-only branch is refused by the backend
+                  // (BRANCH_IS_REMOTE_ONLY), so it is not offered as a target.
+                  disabled: branch.is_remote,
+                  key: `${branch.is_remote ? 'r' : 'l'}-${branch.name}`,
+                  value: branch.name
+                },
+                `${branch.name}${branch.is_current ? ' (current)' : ''}${branch.is_remote ? ' (remote)' : ''}`
+              )
+            )
+          ),
+          checkoutButton(
+            checkingOut ? 'Checking out…' : 'Checkout',
+            () => target && doCheckout(target, {}),
+            checkingOut || !target
+          )
+        ),
+
+        // The dirty-tree question, answered by the user — never auto-stashed.
+        dirtyChoice
+          ? createElement(
+              'div',
+              { className: 'rounded border border-[var(--ui-stroke-focus)] p-2 text-xs', 'data-dirty-choice': dirtyChoice.branch },
+              createElement('p', { className: 'mb-1.5' }, `${dirtyChoice.message} Pick what happens to those changes:`),
+              createElement(
+                'div',
+                { className: 'flex flex-wrap gap-1.5' },
+                checkoutButton('Stash & checkout', () => doCheckout(dirtyChoice.branch, { stash: true }), false),
+                checkoutButton('Force checkout', () => doCheckout(dirtyChoice.branch, { force: true }), false),
+                checkoutButton('Cancel', () => setDirtyChoice(null), false)
+              )
+            )
+          : null
+      ),
+
+      // ── confirms ───────────────────────────────────────────────────────
+      // Delete-with-force: force is the confirm's own action, so the label
+      // names the loss rather than hiding it behind a generic "Remove".
+      createElement(ConfirmDialog, {
+        cancelLabel: 'Keep',
+        confirmLabel: armedDelete?.is_dirty ? 'Remove anyway' : 'Remove',
+        description: armedDelete
+          ? `${armedDelete.path}${armedDelete.branch ? ` (${armedDelete.branch})` : ''}` +
+            (armedDelete.is_dirty
+              ? '\n\nIt has uncommitted changes. Removing discards them — this cannot be undone.'
+              : '')
+          : '',
+        destructive: true,
+        onClose: () => setArmedDelete(null),
+        onConfirm: async () => {
+          const target_ = armedDelete
+
+          setArmedDelete(null)
+          if (target_) await runDelete(target_, target_.is_dirty)
+        },
+        open: !!armedDelete,
+        title: 'Remove worktree?'
+      }),
+
+      createElement(ConfirmDialog, {
+        cancelLabel: 'Cancel',
+        confirmLabel: bulkForce ? 'Force delete all' : `Delete ${cleanRemovable}`,
+        description:
+          `Removes ${cleanRemovable} worktree${cleanRemovable === 1 ? '' : 's'} permanently.` +
+          (dirtyWorktrees
+            ? `\n\n${dirtyWorktrees} dirty worktree${dirtyWorktrees === 1 ? '' : 's'} will be ${bulkForce ? 'FORCE-REMOVED with their uncommitted changes discarded' : 'skipped'}.`
+            : ''),
+        destructive: true,
+        // The force choice is a real checkbox, not a second dialog stack.
+        children: dirtyWorktrees
+          ? createElement(
+              'label',
+              { className: 'mb-2 flex items-start gap-1.5 text-xs' },
+              createElement('input', {
+                type: 'checkbox',
+                checked: bulkForce,
+                onChange: event => setBulkForce(event.target.checked),
+                style: { marginTop: 2 }
+              }),
+              createElement('span', null, `Also force-remove the ${dirtyWorktrees} dirty one${dirtyWorktrees === 1 ? '' : 's'} (discards uncommitted changes)`)
+            )
+          : null,
+        onClose: () => setArmedBulk(false),
+        onConfirm: async () => {
+          const force = bulkForce
+
+          setBulkForce(false)
+          await runBulkDelete(force)
+        },
+        open: armedBulk,
+        title: 'Delete removable worktrees?'
+      })
+    )
+  )
+}
+
 function WorkingTreePanel({ projectName }) {
   const client = useQueryClient()
   const status = useQuery({
@@ -279,7 +931,9 @@ function WorkingTreePanel({ projectName }) {
   const [error, setError] = useState(null)
   const [busyPath, setBusyPath] = useState(null)
   const [fetching, setFetching] = useState(false)
+  const [stashing, setStashing] = useState(false)
   const [confirm, setConfirm] = useState(null)
+  const [stashConfirm, setStashConfirm] = useState(false)
   const [diff, setDiff] = useState(null)
 
   // After a mutation the SERVER caches /projects, and the parent's badges read
@@ -354,6 +1008,35 @@ function WorkingTreePanel({ projectName }) {
     }
   }, [fetching, projectName, settle])
 
+  // `git stash push -u` sweeps every change (untracked included) off the tree
+  // and leaves it on the stack. Same shape as runFetch: the stash route raises
+  // a 400 {detail} on failure and answers {success, message, stderr} otherwise,
+  // so BOTH shapes have to be checked.
+  const runStash = useCallback(async () => {
+    if (stashing) return
+
+    setStashing(true)
+    setError(null)
+
+    try {
+      const result = await gitStash(projectName)
+
+      setStashing(false)
+
+      if (!result?.success) {
+        setError(result?.message || result?.stderr || 'Stash failed.')
+
+        return
+      }
+
+      // The whole point of the op: the tree is clean now, so re-read status.
+      await settle()
+    } catch (err) {
+      setStashing(false)
+      setError(errText(err))
+    }
+  }, [projectName, settle, stashing])
+
   const openDiff = useCallback(async path => {
     if (!path) return
 
@@ -388,7 +1071,7 @@ function WorkingTreePanel({ projectName }) {
   const files = status.data
   const modified = files?.modified_files || []
   const untracked = files?.untracked_files || []
-  const locked = busyPath !== null || fetching
+  const locked = busyPath !== null || fetching || stashing
 
   const fileRow = (file, key, isUntracked) => {
     const path = filePath(file)
@@ -482,12 +1165,41 @@ function WorkingTreePanel({ projectName }) {
           variant: 'outline'
         },
         fetching ? 'Fetching…' : 'Fetch'
+      ),
+      // Stash-all sits beside the commit field on the web. It only arms the
+      // confirm here — nothing is requested until the dialog confirms.
+      createElement(
+        Button,
+        {
+          className: 'border-destructive/40 text-destructive hover:bg-destructive/10',
+          disabled: locked,
+          onClick: () => setStashConfirm(true),
+          size: 'sm',
+          title: 'Move all changes (including untracked) to the stash',
+          variant: 'outline'
+        },
+        stashing ? 'Stashing…' : 'Stash all'
       )
     ),
     // The op's own failure message — a rejected promise must never look like a
     // no-op, and it must not be the only place the reason shows up.
     error ? createElement('p', { className: 'text-sm text-destructive', role: 'alert' }, error) : null,
     body,
+    createElement(ConfirmDialog, {
+      cancelLabel: 'Cancel',
+      confirmLabel: 'Stash all',
+      description:
+        'This runs `git stash push -u` — every change, tracked and untracked, leaves the working tree. ' +
+        'The entry stays on the stack (`stash@{0}`) so `git stash pop` brings it back. This cannot be undone from here.',
+      destructive: true,
+      onClose: () => setStashConfirm(false),
+      onConfirm: async () => {
+        setStashConfirm(false)
+        await runStash()
+      },
+      open: stashConfirm,
+      title: 'Stash all changes?'
+    }),
     createElement(ConfirmDialog, {
       cancelLabel: 'Cancel',
       confirmLabel: 'Discard',
@@ -506,7 +1218,12 @@ function WorkingTreePanel({ projectName }) {
       open: !!confirm,
       title: 'Discard changes?'
     }),
-    diff ? createElement(DiffOverlay, { diff, onClose: closeDiff }) : null
+    diff ? createElement(DiffOverlay, { diff, onClose: closeDiff }) : null,
+    // Under the working tree, same order as the web card: branches, commits,
+    // then the worktree block that owns the checkout.
+    createElement(ProjectBranches, { projectName }),
+    createElement(ProjectCommits, { projectName }),
+    createElement(WorktreesSection, { projectName })
   )
 }
 
@@ -554,21 +1271,384 @@ const relativeAge = iso => {
   return rel.startsWith('-') ? `${rel.slice(1)} ago` : 'just now'
 }
 
-/** One project row. Pure — takes a ProjectItem, renders no fetching. */
-function ProjectCard({ project, selected, onSelect }) {
-  const branch = project.current_branch || 'DETACHED'
-  const age = project.last_commit_date ? relativeAge(project.last_commit_date) : null
+/**
+ * Watched folders — the source of the project list, so without it the page is
+ * read-only on a fresh install. Same routes the web dashboard uses: list,
+ * add, rename, reorder, remove, and the path autocomplete.
+ */
+function WatchFolders({ client }) {
+  const [path, setPath] = useState('')
+  const [type, setType] = useState('scan_root')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
+  // Inline label edit: {id, value, saving}. The web double-clicks a label;
+  // an always-present input is keyboard-reachable with no hidden gesture.
+  const [editing, setEditing] = useState(null)
+  const [reordering, setReordering] = useState(false)
+  const [suggestions, setSuggestions] = useState([])
+  // The value the user just picked from the dropdown. Without it the debounce
+  // re-queries for the picked path and the listbox springs back open on the
+  // item that was just clicked.
+  const [picked, setPicked] = useState(null)
+
+  const { data, isPending } = useQuery({
+    queryKey: [...PM_QUERY_ROOT, 'watch-paths'],
+    queryFn: fetchWatchPaths
+  })
+
+  const folders = data?.watch_paths ?? []
+
+  // A rename or a reorder changes what the projects list is ordered by, so
+  // both bust the SERVER cache first — same order submit()/remove() use.
+  const refetchAll = async () => {
+    await refreshProjects()
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'watch-paths'] })
+    await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'projects'] })
+  }
+
+  const submit = async () => {
+    const trimmed = path.trim()
+    if (!trimmed || saving) return
+    setSaving(true)
+    setError(null)
+    try {
+      await addWatchPath(trimmed, type)
+      setPath('')
+      setSuggestions([])
+      // A new folder means a new scan: bust the server cache, then re-read.
+      await refetchAll()
+    } catch (err) {
+      setError(errorText(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const remove = async id => {
+    setError(null)
+    try {
+      await deleteWatchPath(id)
+      await refetchAll()
+    } catch (err) {
+      setError(errorText(err))
+    }
+  }
+
+  const saveLabel = async (entry, value) => {
+    const label = value.trim()
+    // An empty label is a 400 (label must not be empty) and the row already
+    // falls back to its path, so just close the editor untouched.
+    if (!label || label === (entry.label ?? '')) {
+      setEditing(null)
+
+      return
+    }
+    setEditing({ ...editing, saving: true })
+    setError(null)
+    try {
+      // Body is exactly {label} — RenameRequest has one field.
+      await renameWatchPath(entry.id, label)
+      setEditing(null)
+      await refetchAll()
+    } catch (err) {
+      setEditing(prev => (prev ? { ...prev, saving: false } : prev))
+      setError(errorText(err))
+    }
+  }
+
+  // ▲ / ▼ instead of drag: keyboard-reachable and no drag library. The server
+  // assigns sort_order from the array index, so the FULL id list goes up.
+  const move = async (index, delta) => {
+    if (reordering) return
+    const target = index + delta
+    if (target < 0 || target >= folders.length) return
+    const ids = folders.map(entry => entry.id)
+    const [moved] = ids.splice(index, 1)
+    ids.splice(target, 0, moved)
+    setReordering(true)
+    setError(null)
+    try {
+      await reorderWatchPaths(ids)
+      await refetchAll()
+    } catch (err) {
+      setError(errorText(err))
+    } finally {
+      setReordering(false)
+    }
+  }
+
+  // Debounced path autocomplete. The route 400s on a prefix under 2 chars, so
+  // the request is only made once the input is long enough to be useful.
+  const debouncedPath = useDebounced(path, 200)
+
+  useEffect(() => {
+    const prefix = debouncedPath.trim()
+    // A pick is the user's answer, not a new question: hold the listbox shut
+    // until they actually type again.
+    if (picked !== null && prefix === picked) {
+      setSuggestions([])
+
+      return
+    }
+    if (prefix.length < 2) {
+      setSuggestions([])
+
+      return
+    }
+    let live = true
+    suggestWatchPaths(prefix).then(
+      payload => {
+        if (!live) return
+        setSuggestions(Array.isArray(payload?.suggestions) ? payload.suggestions : [])
+      },
+      // A bad prefix just means no dropdown — never an error the user must clear.
+      () => {
+        if (live) setSuggestions([])
+      }
+    )
+    return () => {
+      live = false
+    }
+  }, [debouncedPath, picked])
+
+  const field = 'w-full rounded border border-[var(--ui-stroke-secondary)] bg-transparent px-2 py-1 text-sm outline-none focus:border-[var(--ui-stroke-focus)]'
 
   return createElement(
+    'section',
+    { className: 'rounded-[6px] border border-[var(--ui-stroke-secondary)] p-3', 'aria-label': 'Watched folders' },
+    createElement('h2', { className: 'mb-2 text-sm font-medium' }, 'Watched folders'),
+    isPending
+      ? createElement('div', { className: 'text-sm text-muted-foreground' }, 'Loading…')
+      : folders.length === 0
+        ? createElement(
+            'p',
+            { className: 'mb-2 text-xs text-muted-foreground' },
+            'No folders watched yet. Add one and the projects inside it appear below.'
+          )
+        : createElement(
+            'ul',
+            { className: 'mb-2 space-y-1' },
+            folders.map((entry, index) => {
+              const isEditing = editing?.id === entry.id
+              const pathCell = createElement('span', { className: 'truncate', title: entry.path }, entry.path)
+
+              return createElement(
+                'li',
+                { key: String(entry.id), className: 'flex items-center gap-2 text-xs' },
+                // Reorder handles. Disabled at the ends so the row they move
+                // past always exists.
+                createElement(
+                  'span',
+                  { className: 'flex shrink-0 flex-col' },
+                  createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      'aria-label': `Move ${entry.path} up`,
+                      className: 'h-3 leading-none text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-30',
+                      disabled: reordering || index === 0,
+                      onClick: () => move(index, -1),
+                      title: 'Move up'
+                    },
+                    '▲'
+                  ),
+                  createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      'aria-label': `Move ${entry.path} down`,
+                      className: 'h-3 leading-none text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-30',
+                      disabled: reordering || index === folders.length - 1,
+                      onClick: () => move(index, 1),
+                      title: 'Move down'
+                    },
+                    '▼'
+                  )
+                ),
+                createElement('span', { className: 'min-w-0 flex-1 truncate' }, pathCell),
+                createElement(Badge, { variant: 'muted', size: 'xs' }, entry.type === 'single_repo' ? 'single repo' : 'scan root'),
+                isEditing
+                  ? createElement(
+                      'span',
+                      { className: 'flex shrink-0 items-center gap-1' },
+                      createElement('input', {
+                        type: 'text',
+                        autoFocus: true,
+                        disabled: editing.saving,
+                        value: editing.value,
+                        'aria-label': `Label for ${entry.path}`,
+                        placeholder: 'Label',
+                        className: 'w-32 rounded border border-[var(--ui-stroke-secondary)] bg-background px-1.5 py-0.5 text-xs outline-none focus:border-[var(--ui-stroke-focus)]',
+                        onChange: event => setEditing({ ...editing, value: event.target.value }),
+                        // Enter saves, Escape abandons — a blur also saves, but
+                        // Escape must not be undone by the blur that follows it.
+                        onKeyDown: event => {
+                          if (event.key === 'Enter') {
+                            event.preventDefault()
+                            saveLabel(entry, editing.value)
+                          }
+                          if (event.key === 'Escape') {
+                            event.preventDefault()
+                            setEditing(null)
+                          }
+                        },
+                        onBlur: () => saveLabel(entry, editing.value)
+                      }),
+                      createElement(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'shrink-0 rounded border border-[var(--ui-stroke-secondary)] px-2 py-0.5 hover:bg-accent/10 disabled:opacity-50',
+                          disabled: editing.saving,
+                          onMouseDown: event => event.preventDefault(),
+                          onClick: () => saveLabel(entry, editing.value)
+                        },
+                        editing.saving ? 'Saving…' : 'Save'
+                      )
+                    )
+                  : createElement(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'max-w-40 shrink-0 truncate rounded border border-transparent px-1.5 py-0.5 text-xs text-muted-foreground hover:border-[var(--ui-stroke-secondary)] hover:bg-accent/10',
+                        onClick: () => setEditing({ id: entry.id, value: entry.label ?? '', saving: false }),
+                        title: entry.label ? `${entry.label} — edit label` : 'Add a label'
+                      },
+                      entry.label || '—'
+                    ),
+                createElement('button', {
+                  type: 'button',
+                  className: 'shrink-0 rounded border border-[var(--ui-stroke-secondary)] px-2 py-0.5 hover:bg-accent/10',
+                  onClick: () => remove(entry.id)
+                }, 'Remove')
+              )
+            })
+          ),
+    error ? createElement('p', { role: 'alert', className: 'mb-2 text-xs text-destructive' }, error) : null,
+    createElement(
+      'div',
+      { className: 'relative flex flex-wrap items-center gap-1.5' },
+      createElement('input', {
+        type: 'text',
+        className: `${field} min-w-0 flex-1`,
+        placeholder: '/home/user/projects',
+        'aria-label': 'Folder path',
+        value: path,
+        // Typing after a pick re-opens the question; a programmatic set does not.
+        onChange: event => {
+          setPicked(null)
+          setPath(event.target.value)
+        },
+        onKeyDown: event => {
+          if (event.key === 'Enter') {
+            event.preventDefault()
+            submit()
+          }
+        }
+      }),
+      createElement(
+        'select',
+        { className: `${field} w-auto`, value: type, onChange: event => setType(event.target.value) },
+        createElement('option', { value: 'scan_root' }, 'Scan subfolders'),
+        createElement('option', { value: 'single_repo' }, 'This folder is one repo')
+      ),
+      createElement(
+        'button',
+        {
+          type: 'button',
+          className: 'shrink-0 rounded border border-[var(--ui-stroke-secondary)] px-2 py-1 text-sm hover:bg-accent/10 disabled:opacity-50',
+          disabled: saving || !path.trim(),
+          onClick: submit
+        },
+        saving ? 'Adding…' : 'Add folder'
+      ),
+      // Autocomplete dropdown. Rendered inside the same relative wrapper as the
+      // input so it sits under it without a portal.
+      suggestions.length
+        ? createElement(
+            'ul',
+            {
+              className:
+                'absolute left-0 right-0 top-full z-20 mt-0.5 max-h-48 overflow-y-auto rounded border border-[var(--ui-stroke-secondary)] bg-background py-0.5 text-xs shadow-md',
+              role: 'listbox',
+              'aria-label': 'Path suggestions',
+              'data-suggestions': suggestions.length
+            },
+            suggestions.map(item =>
+              createElement(
+                'li',
+                { key: item, role: 'option', 'aria-selected': false },
+                createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'block w-full truncate px-2 py-1 text-left hover:bg-accent/10',
+                    onClick: () => {
+                      setPicked(item)
+                      setPath(item)
+                      setSuggestions([])
+                    }
+                  },
+                  item
+                )
+              )
+            )
+          )
+        : null
+    )
+  )
+}
+
+/**
+ * One project row.
+ *
+ * `panel` is the working-tree detail for THIS project (null when another one
+ * is selected). It renders inside the card so the detail sits under the project
+ * it belongs to — at the bottom of a long list it was off-screen, which made
+ * the page unusable.
+ */
+function ProjectCard({ project, selected, onSelect, panel, panelError, cardError, busyPath, onCardAction }) {
+  const branch = project.current_branch || 'DETACHED'
+  const age = project.last_commit_date ? relativeAge(project.last_commit_date) : null
+  const isBusy = busyPath === project.name
+
+  // Per-card actions, matching the web dashboard's rules: Pull is refused by
+  // the backend on a dirty tree, and Commit only makes sense when there is
+  // something to commit.
+  const action = (label, title, disabled, onClick) =>
+    createElement(
+      'button',
+      {
+        type: 'button',
+        className: cn(
+          'shrink-0 rounded border px-2 py-0.5 text-xs transition-colors',
+          disabled
+            ? 'cursor-not-allowed border-[var(--ui-stroke-secondary)] text-muted-foreground/50'
+            : 'border-[var(--ui-stroke-secondary)] hover:bg-accent/10'
+        ),
+        title,
+        disabled: disabled || isBusy,
+        'aria-label': `${label} ${project.name}`,
+        onClick: event => {
+          // The card itself is a button; without this the action click would
+          // bubble and toggle the selection as well.
+          event.stopPropagation()
+          onClick()
+        }
+      },
+      label
+    )
+
+  const head = createElement(
     'div',
     {
       className: cn(
-        'w-full rounded-[6px] border p-3 text-left transition-colors',
-        selected ? 'border-[var(--ui-stroke-focus)] bg-accent/5' : 'border-[var(--ui-stroke-secondary)] hover:bg-accent/5'
+        'flex w-full items-center gap-3 rounded-[6px] px-3 py-2 text-left transition-colors',
+        selected ? 'bg-accent/5' : 'hover:bg-accent/5'
       ),
       role: 'button',
       tabIndex: 0,
-      'aria-pressed': selected,
+      'aria-expanded': !!selected,
       'data-project': project.name,
       onClick: () => onSelect?.(project.name),
       onKeyDown: event => {
@@ -580,20 +1660,8 @@ function ProjectCard({ project, selected, onSelect }) {
     },
     createElement(
       'div',
-      { className: 'flex items-start justify-between gap-2' },
-      createElement(
-        'div',
-        { className: 'min-w-0' },
-        createElement('div', { className: 'truncate text-sm font-medium text-foreground' }, project.name),
-        createElement(
-          'div',
-          { className: 'mt-0.5 flex items-center gap-1 text-xs text-muted-foreground' },
-          createElement(Codicon, { name: 'source-control', size: '0.85em' }),
-          createElement('span', { className: 'truncate' }, branch)
-        )
-      ),
-      // Ahead/behind only mean something against an upstream; a repo with
-      // no remote would otherwise always read "0/0" and look falsely synced.
+      { className: 'flex min-w-0 w-40 shrink-0 items-center gap-1.5' },
+      createElement('span', { className: 'truncate text-sm font-medium text-foreground' }, project.name),
       project.branch_count > 0
         ? createElement(Badge, { variant: 'muted', size: 'xs', title: 'local branches' }, `${project.branch_count} br`)
         : null
@@ -601,7 +1669,14 @@ function ProjectCard({ project, selected, onSelect }) {
 
     createElement(
       'div',
-      { className: 'mt-2 flex flex-wrap items-center gap-1.5' },
+      { className: 'flex min-w-0 w-32 shrink-0 items-center gap-1 text-xs text-muted-foreground' },
+      createElement(Codicon, { name: 'source-control', size: '0.85em' }),
+      createElement('span', { className: 'truncate' }, branch)
+    ),
+
+    createElement(
+      'div',
+      { className: 'flex shrink-0 items-center gap-1' },
       project.is_dirty ? createElement(Badge, { variant: 'warn', size: 'xs' }, 'dirty') : null,
       project.ahead > 0 ? createElement(Badge, { variant: 'success', size: 'xs' }, `↑${project.ahead}`) : null,
       project.behind > 0 ? createElement(Badge, { variant: 'destructive', size: 'xs' }, `↓${project.behind}`) : null,
@@ -609,23 +1684,71 @@ function ProjectCard({ project, selected, onSelect }) {
         ? createElement(Badge, { variant: 'outline', size: 'xs' }, 'clean')
         : null,
       project.remote_url
-        ? createElement(
-            'span',
-            { className: 'truncate text-xs text-muted-foreground', title: project.remote_url },
-            shortRemote(project.remote_url)
-          )
+        ? createElement('span', { className: 'truncate text-xs text-muted-foreground', title: project.remote_url }, shortRemote(project.remote_url))
         : createElement(Badge, { variant: 'muted', size: 'xs' }, 'no remote')
     ),
 
-    project.last_commit_message
+    createElement(
+      'div',
+      { className: 'min-w-0 flex-1' },
+      project.last_commit_message
+        ? createElement(
+            'div',
+            { className: 'truncate text-xs text-muted-foreground', title: project.last_commit_message },
+            project.last_commit_message
+          )
+        : null
+    ),
+
+    age ? createElement('div', { className: 'shrink-0 text-xs text-muted-foreground/70' }, age) : null,
+
+    createElement(
+      'div',
+      { className: 'flex shrink-0 items-center gap-1' },
+      action('Pull', 'Fast-forward from the upstream branch', !!project.is_dirty, () => onCardAction('pull', project.name)),
+      action('Fetch', 'Fetch from the remote without touching the working tree', false, () => onCardAction('fetch', project.name)),
+      // Same rule as the web card: a Push button with nothing to push is just
+      // a way to get a rejection, so it only exists when ahead > 0.
+      project.ahead > 0
+        ? action('Push', `Push ${project.ahead} commit${project.ahead === 1 ? '' : 's'} to the remote branch`, false, () => onCardAction('push', project.name))
+        : null,
+      project.is_dirty
+        ? action('Commit', 'Commit the staged changes', false, () => onCardAction('commit', project.name))
+        : null
+    )
+  )
+
+  return createElement(
+    'div',
+    {
+      className: cn(
+        'w-full rounded-[6px] border',
+        selected ? 'border-[var(--ui-stroke-focus)]' : 'border-[var(--ui-stroke-secondary)]'
+      ),
+      'data-card': project.name
+    },
+    head,
+    // A card-action failure renders on ITS OWN card, unselected, so a
+    // rejected fetch is visible where the user clicked it.
+    cardError
       ? createElement(
           'div',
-          { className: 'mt-2 truncate text-xs text-muted-foreground', title: project.last_commit_message },
-          project.last_commit_message
+          { role: 'alert', 'data-card-error': project.name, className: 'px-3 pb-2 text-xs text-destructive' },
+          cardError
         )
       : null,
-    age
-      ? createElement('div', { className: 'mt-0.5 text-xs text-muted-foreground/70' }, `last commit ${age}`)
+    panel || panelError
+      ? createElement(
+          'div',
+          { className: 'border-t border-[var(--ui-stroke-secondary)] px-3 py-2', 'data-detail': project.name },
+          panelError
+            ? createElement('div', { role: 'alert', className: 'text-sm text-destructive' }, panelError)
+            : null,
+          !panel && !panelError
+            ? createElement('div', { className: 'text-sm text-muted-foreground' }, 'Loading working tree…')
+            : null,
+          panel ?? null
+        )
       : null
   )
 }
@@ -678,7 +1801,23 @@ function ProjectsPage() {
   const [selected, setSelected] = useState(null)
   const [panel, setPanel] = useState(null)
   const [panelError, setPanelError] = useState(null)
+  // Card-action failures belong to the card that failed. Paging them into the
+  // page-level panelError painted them on whichever card happened to be open —
+  // or nowhere at all, when none was.
+  const [cardError, setCardError] = useState(null)
   const [busy, setBusy] = useState(false)
+  // Which project's card action is in flight. Per-card, so clicking one row
+  // never disables every other row's buttons.
+  const [busyPath, setBusyPath] = useState(null)
+  // Commit asks for a message in a real inline form: there is no
+  // window.prompt in the Electron renderer, and a modal is what the web
+  // dashboard does too.
+  const [commitFor, setCommitFor] = useState(null)
+  const [commitMessage, setCommitMessage] = useState('')
+  // Watch folders + the bulk pull.
+  const [watchOpen, setWatchOpen] = useState(false)
+  const [pullingAll, setPullingAll] = useState(false)
+  const [notice, setNotice] = useState(null)
 
   const query = useDebounced(search)
   const client = useQueryClient()
@@ -721,6 +1860,79 @@ function ProjectsPage() {
       live = false
     }
   }, [selected])
+
+  // A card's Pull / Fetch / Commit. `message` is supplied by the commit form;
+  // there is no prompt to answer, because the Electron renderer has none.
+  const onCardAction = async (action, name, message) => {
+    if (busyPath) return
+
+    if (action === 'commit' && !message) {
+      setCommitFor(name)
+      setCommitMessage('')
+      return
+    }
+
+    setBusyPath(name)
+    try {
+      const result =
+        action === 'pull' ? await gitPull(name)
+          : action === 'push' ? await gitPush(name)
+            : action === 'fetch' ? await gitFetch(name)
+              : await gitCommit(name, message)
+
+      // The contract is HTTP 200 + success:false — a resolved promise is NOT
+      // a success, and pretending otherwise repaints stale badges.
+      if (result && result.success === false) {
+        setCardError({ name, text: result.message || result.stderr || `${action} failed` })
+        return
+      }
+      // git push writes its progress ("To github.com…", object counts) to
+      // stderr even on a clean run, so a stderr alone is only a failure when
+      // the route did not report success.
+      if (result && result.stderr && result.success !== true) {
+        setCardError({ name, text: result.stderr })
+        return
+      }
+
+      setCardError(null)
+      // A push/pull/commit moves ahead-behind and the working tree, so the
+      // open panel's status is invalidated too — not just the list badges.
+      await refreshProjects()
+      await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'projects'] })
+      if (selected) {
+        await client.invalidateQueries({ queryKey: gitStatusKey(selected) })
+      }
+    } catch (err) {
+      setCardError({ name, text: errorText(err) })
+    } finally {
+      setBusyPath(null)
+      setCommitFor(null)
+      setCommitMessage('')
+    }
+  }
+
+  // Pull every tracked project in one call. The backend skips dirty ones and
+  // reports per-project outcomes, so the summary is the useful part.
+  const onPullAll = async () => {
+    if (pullingAll) return
+    setPullingAll(true)
+    try {
+      const result = await pullAll()
+      const summary = result
+        ? `${result.pulled} pulled, ${result.already_up_to_date} up to date, ${result.dirty_skipped} dirty skipped, ${result.failed} failed`
+        : 'Pull all finished'
+      // The summary is a page-level fact, so it goes to the page-level
+      // channel — on the panel it was invisible unless a card happened to be
+      // open. Failures read as errors; a clean run reads as a status.
+      setNotice(summary)
+      setCardError(result && result.failed > 0 ? { name: null, text: summary } : null)
+      await client.invalidateQueries({ queryKey: [...PM_QUERY_ROOT, 'projects'] })
+    } catch (err) {
+      setPanelError(errorText(err))
+    } finally {
+      setPullingAll(false)
+    }
+  }
 
   const onRefresh = async () => {
     setBusy(true)
@@ -782,8 +1994,97 @@ function ProjectsPage() {
           )
         },
         busy ? 'Refreshing…' : 'Refresh'
+      ),
+      createElement(
+        'button',
+        {
+          type: 'button',
+          onClick: () => setWatchOpen(open => !open),
+          'aria-expanded': watchOpen,
+          className:
+            'h-8 shrink-0 rounded-[6px] border border-[var(--ui-stroke-secondary)] px-3 text-sm hover:bg-accent/10'
+        },
+        'Folders…'
+      ),
+      createElement(
+        'button',
+        {
+          type: 'button',
+          onClick: onPullAll,
+          disabled: pullingAll,
+          className: cn(
+            'h-8 shrink-0 rounded-[6px] border border-[var(--ui-stroke-secondary)] px-3 text-sm hover:bg-accent/10',
+            pullingAll && 'opacity-60'
+          )
+        },
+        pullingAll ? 'Pulling all…' : 'Pull all'
       )
     ),
+
+    watchOpen ? createElement(WatchFolders, { client }) : null,
+
+    notice
+      ? createElement(
+          'div',
+          { role: 'status', 'data-notice': notice, className: 'rounded-[6px] border border-[var(--ui-stroke-secondary)] p-2 text-xs text-muted-foreground' },
+          notice
+        )
+      : null,
+
+    commitFor
+      ? createElement(
+          'div',
+          {
+            className:
+              'flex flex-wrap items-center gap-1.5 rounded-[6px] border border-[var(--ui-stroke-focus)] p-2',
+            'data-commit-for': commitFor
+          },
+          createElement('span', { className: 'text-xs text-muted-foreground' }, `Commit message — ${commitFor}`),
+          createElement('input', {
+            type: 'text',
+            autoFocus: true,
+            value: commitMessage,
+            placeholder: 'fix: …',
+            'aria-label': 'Commit message',
+            onChange: event => setCommitMessage(event.target.value),
+            onKeyDown: event => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                onCardAction('commit', commitFor, commitMessage.trim())
+              }
+              if (event.key === 'Escape') {
+                setCommitFor(null)
+                setCommitMessage('')
+              }
+            },
+            className:
+              'h-8 min-w-0 flex-1 rounded-[6px] border border-[var(--ui-stroke-secondary)] bg-background px-2 text-sm outline-none focus:border-[var(--ui-stroke-focus)]'
+          }),
+          createElement(
+            'button',
+            {
+              type: 'button',
+              disabled: !commitMessage.trim(),
+              onClick: () => onCardAction('commit', commitFor, commitMessage.trim()),
+              className:
+                'h-8 shrink-0 rounded-[6px] border border-[var(--ui-stroke-secondary)] px-3 text-sm hover:bg-accent/10 disabled:opacity-50'
+            },
+            'Commit'
+          ),
+          createElement(
+            'button',
+            {
+              type: 'button',
+              onClick: () => {
+                setCommitFor(null)
+                setCommitMessage('')
+              },
+              className: 'h-8 shrink-0 rounded-[6px] border border-[var(--ui-stroke-secondary)] px-3 text-sm hover:bg-accent/10'
+            },
+            'Cancel'
+          )
+        )
+      : null,
 
     error
       ? createElement(
@@ -814,7 +2115,22 @@ function ProjectsPage() {
               key: project.name,
               project,
               selected: selected === project.name,
-              onSelect: name => setSelected(prev => (prev === name ? null : name))
+              onSelect: name => setSelected(prev => (prev === name ? null : name)),
+              panel:
+                selected === project.name && panel
+                  ? // key: React reuses the instance across a project switch, so
+                    // without it the previous project's error message, armed
+                    // confirm and busyPath stay painted over the new project's
+                    // file list — and an armed discard can fire at the wrong repo.
+                    createElement(panel.WorkingTreePanel, {
+                      key: selected,
+                      projectName: selected
+                    })
+                  : null,
+              panelError: selected === project.name ? panelError : null,
+              cardError: cardError && cardError.name === project.name ? cardError.text : null,
+              busyPath,
+              onCardAction
             })
           )
         )
@@ -855,30 +2171,9 @@ function ProjectsPage() {
       )
     ),
 
-    selected
-      ? createElement(
-          'section',
-          { className: 'mt-2 border-t border-[var(--ui-stroke-secondary)] pt-3', 'data-detail': selected },
-          createElement('h2', { className: 'mb-2 text-sm font-medium' }, `Working tree — ${selected}`),
-          panelError
-            ? createElement('div', { role: 'alert', className: 'text-sm text-destructive' }, panelError)
-            : null,
-          !panel && !panelError
-            ? createElement('div', { className: 'text-sm text-muted-foreground' }, 'Loading working tree…')
-            : null,
-          panel
-            ? createElement(
-                'div',
-                null,
-                // key: React reuses the instance across a project switch, so
-                // without it the previous project's error message, armed
-                // confirm and busyPath stay painted over the new project's
-                // file list — and an armed discard can fire at the wrong repo.
-                createElement(panel.WorkingTreePanel, { key: selected, projectName: selected })
-              )
-            : null
-        )
-      : null
+    // The working-tree panel renders inside ProjectCard, under the row you
+    // clicked. It used to live here at the bottom of the whole list, which put
+    // it several screens below the project you opened.
   )
 }
 

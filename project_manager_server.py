@@ -25,6 +25,7 @@ import os
 import sys
 import argparse
 import logging
+import secrets
 from pathlib import Path
 
 # Add the plugin dashboard directory to sys.path so we can import the modules
@@ -41,14 +42,49 @@ from plugin_api import router as project_manager_router
 from db import init_db
 
 # FastAPI imports
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
+
+# The router serves writes: git commit, push, discard (which runs
+# `git clean -f`) and worktree removal. On 127.0.0.1 with no auth, every web
+# page the user opens could reach them, because a wildcard CORS origin tells
+# the browser it may send the cross-origin request. The token below is the
+# boundary; the origin allowlist is defence in depth and allows nothing by
+# default.
+_API_TOKEN = secrets.token_urlsafe(32)
+
+
+def _token_of(request: Request) -> str | None:
+    """The bearer token for *request*, or None.
+
+    Never read it from the query string: a token in a URL leaks into access
+    logs, proxy logs and the Referer header of every outbound link.
+    """
+    header = request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return request.headers.get("x-project-manager-token")
+
+
+def _require_token(request: Request) -> JSONResponse | None:
+    """A 401 response when the request carries no valid token, else None."""
+    presented = _token_of(request)
+    if presented and secrets.compare_digest(presented, _API_TOKEN):
+        return None
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": "missing or invalid API token",
+            "code": "UNAUTHORIZED",
+        },
+    )
 
 
 def create_app() -> FastAPI:
@@ -63,14 +99,29 @@ def create_app() -> FastAPI:
         version="1.0.0",
     )
 
-    # CORS middleware - allow requests from the Hermes dashboard
+    # CORS - allow requests from the Hermes dashboard
+    # Explicit allowlist, empty by default. A wildcard origin plus
+    # allow_credentials is what made every write route reachable from any web
+    # page; with the token required, allowing no origin is the safe default.
+    allowed = [
+        o.strip()
+        for o in os.environ.get("PROJECT_MANAGER_CORS_ORIGINS", "").split(",")
+        if o.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Restrict in production
-        allow_credentials=True,
+        allow_origins=allowed,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def _auth(request: Request, call_next):
+        denied = _require_token(request)
+        if denied is not None:
+            return denied
+        return await call_next(request)
 
     # Mount the plugin router at root (nginx handles the /api/plugins/<name>/ prefix)
     app.include_router(
@@ -120,6 +171,9 @@ def main() -> None:
         args.host,
         args.port,
     )
+    # Printed once, at startup: the token exists only for this run, so there
+    # is nothing to store and nothing to rotate.
+    log.info("API token (send as 'Authorization: Bearer <token>'): %s", _API_TOKEN)
 
     uvicorn.run(
         app,

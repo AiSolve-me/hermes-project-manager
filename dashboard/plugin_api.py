@@ -60,6 +60,8 @@ from git_scanner import (
     git_stash,
     get_last_commit,
     _cleanup_stale_lock,
+    _valid_remote,
+    _valid_branch,
 )
 from db import (
     ALLOWED_PAGE_SIZES,
@@ -655,6 +657,14 @@ def _git_pull(path: str, remote: str = "origin", branch: str | None = None) -> t
     # Record HEAD before the fetch so we can compute a concise summary.
     old_head = _git_rev_parse(path)
 
+    # A caller-supplied remote or branch passed positionally is parsed by git
+    # as an OPTION, and --upload-pack=<cmd> runs <cmd> locally. Both must be
+    # validated before they reach the argv.
+    if not _valid_remote(path, remote):
+        return False, f"Fetch rejected: unknown remote {remote!r}", 0
+    if not _valid_branch(branch):
+        return False, f"Fetch rejected: invalid branch name {branch!r}", 0
+
     fetch_argv = ["fetch", remote, branch]
     try:
         fetch = _run_git(path, fetch_argv, timeout=600)
@@ -866,6 +876,11 @@ async def git_pull_project(
                 # produced the recurring "stale lock + accidental merge"
                 # pattern this replaces.
                 raise HTTPException(status_code=409, detail=f"Pull failed: {msg}")
+            if msg_lower.startswith("fetch rejected"):
+                # 400: the caller's remote or branch never reached git —
+                # our own guard refused it. That is a client input error,
+                # not a server failure, and the status has to say so.
+                raise HTTPException(status_code=400, detail=f"Pull failed: {msg}")
             raise HTTPException(status_code=500, detail=f"Pull failed: {msg}")
 
         # _git_pull now returns added_commits (0 when already up to
@@ -985,6 +1000,12 @@ def _do_pull_project(
             status = "timeout"
         elif "diverged" in msg_lower:
             status = "diverged"
+        elif msg_lower.startswith("fetch rejected"):
+            # Our own guard refused the remote or branch before git saw
+            # it. BatchPullStatus already carries no_remote for exactly
+            # this, and lumping it in with "failed" would report a
+            # server bug for what is a bad argument.
+            status = "no_remote"
         else:
             status = "failed"
         return BatchPullResult(
@@ -1465,6 +1486,17 @@ async def git_fetch_project(
         if not project_path:
             return _err(404, "PROJECT_NOT_FOUND", f"Project '{name}' not found.")
         remote = (payload.remote if payload else "origin") or "origin"
+        # Positional `remote` is an option vector to git — --upload-pack=<cmd>
+        # executes <cmd> — so it must be a remote this repo actually has.
+        if not _valid_remote(project_path, remote):
+            reason = f"Fetch rejected: invalid remote {remote!r}"
+            # stderr is git's channel and this never reached git, so leave it
+            # empty rather than passing our own text off as git's. The mobile
+            # client reads `message` for the user-facing reason and treats a
+            # non-empty stderr as "git said this".
+            return GitFetchResponseDTO(
+                success=False, message=reason, stderr=""
+            )
         try:
             result = _run_git(project_path, ["fetch", remote], timeout=600)
         except subprocess.TimeoutExpired:
