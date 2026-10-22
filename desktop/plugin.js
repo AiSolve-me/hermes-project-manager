@@ -23,6 +23,7 @@ import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   cn,
+  host,
   relativeTime,
   useQuery,
   useQueryClient
@@ -38,17 +39,72 @@ import {
 // looks like a path traversal can't escape the namespace.
 let rest = null
 
-/** Bind the REST door at register time; the disposer is what unload runs. */
-function bindApi(r) {
+/**
+ * Bind the doors at register time; the disposer is what unload runs. BOTH
+ * doors are released by the one disposer: the REST handle and the native
+ * shell handle, so an unloaded plugin can reach neither.
+ */
+function bindDoors(r, open) {
   rest = r
+  openExternal = open
   return () => {
     rest = null
+    openExternal = null
   }
 }
 
 function door() {
   if (!rest) throw new Error('project-manager-desktop: rest door not bound')
   return rest
+}
+
+// ── Native app doors ───────────────────────────────────────────────────────
+// ctx.openExternal hands a URL to the Electron shell, which opens it in the
+// system browser — the desktop equivalent of the web card's window.open().
+// Bound at register time so an unloaded plugin cannot reach it.
+let openExternal = null
+
+/**
+ * The web card's remote normalization, ported: an SSH remote becomes an
+ * HTTPS URL, only http(s) survives, and the .git suffix goes. A remote that
+ * is neither is not a link — the card shows it as plain text.
+ */
+function normalizeRemoteUrl(url) {
+  if (!url) return null
+  let out = url
+  if (out.indexOf('git@') === 0) {
+    out = out.replace(/^git@([^:]+):/, 'https://$1/')
+  }
+  if (out.indexOf('http://') !== 0 && out.indexOf('https://') !== 0) {
+    return null
+  }
+  return out.replace(/\.git$/, '')
+}
+
+/** The host-specific tree URL for a branch — the web card's openBranch(). */
+function branchUrl(remote, branch) {
+  const url = normalizeRemoteUrl(remote)
+  if (!url || !branch) return null
+  if (url.indexOf('github.com') !== -1) return `${url}/tree/${encodeURIComponent(branch)}`
+  if (url.indexOf('gitlab.com') !== -1) return `${url}/-/tree/${encodeURIComponent(branch)}`
+  if (url.indexOf('bitbucket.org') !== -1) return `${url}/src/${encodeURIComponent(branch)}`
+  return `${url}/tree/${encodeURIComponent(branch)}`
+}
+
+/**
+ * Open a URL in the system browser. The door RESOLVES false when the shell
+ * cannot open it — it never throws, because the desktop degrades to false on
+ * a missing bridge — so the resolved value is what says success or failure.
+ * A missing door is a no-op, not a throw: an older desktop without the
+ * capability must not break the card.
+ */
+async function openInBrowser(url) {
+  if (!url || typeof openExternal !== 'function') return false
+  try {
+    return (await openExternal(url)) !== false
+  } catch {
+    return false
+  }
 }
 
 const proj = name => `/projects/${encodeURIComponent(name)}`
@@ -1607,10 +1663,26 @@ function WatchFolders({ client }) {
  * it belongs to — at the bottom of a long list it was off-screen, which made
  * the page unusable.
  */
-function ProjectCard({ project, selected, onSelect, panel, panelError, cardError, busyPath, onCardAction }) {
+function ProjectCard({
+  project,
+  selected,
+  onSelect,
+  panel,
+  panelError,
+  cardError,
+  busyPath,
+  onCardAction,
+  onOpenRemote,
+  onOpenBranch
+}) {
   const branch = project.current_branch || 'DETACHED'
   const age = project.last_commit_date ? relativeAge(project.last_commit_date) : null
   const isBusy = busyPath === project.name
+  // A session can only be aimed at a folder where the SDK exposes the
+  // gateway door; an older desktop without it shows the button disabled
+  // rather than a button that always fails.
+  const canOpenSession =
+    typeof host?.request === 'function' && typeof host?.openSession === 'function' && !!project.path
 
   // Per-card actions, matching the web dashboard's rules: Pull is refused by
   // the backend on a dirty tree, and Commit only makes sense when there is
@@ -1661,7 +1733,25 @@ function ProjectCard({ project, selected, onSelect, panel, panelError, cardError
     createElement(
       'div',
       { className: 'flex min-w-0 w-40 shrink-0 items-center gap-1.5' },
-      createElement('span', { className: 'truncate text-sm font-medium text-foreground' }, project.name),
+      createElement(
+        'span',
+        {
+          className: cn(
+            'truncate text-sm font-medium',
+            // The web card turns the project NAME into the link to its
+            // repository. Same here — the remote decides whether the name is
+            // a link or plain text.
+            project.remote_url ? 'cursor-pointer text-accent hover:underline' : 'text-foreground'
+          ),
+          title: project.remote_url ? 'Open the Git repository' : 'No remote URL',
+          'data-remote-link': project.name,
+          onClick: event => {
+            event.stopPropagation()
+            onOpenRemote?.(project)
+          }
+        },
+        project.name
+      ),
       project.branch_count > 0
         ? createElement(Badge, { variant: 'muted', size: 'xs', title: 'local branches' }, `${project.branch_count} br`)
         : null
@@ -1671,7 +1761,19 @@ function ProjectCard({ project, selected, onSelect, panel, panelError, cardError
       'div',
       { className: 'flex min-w-0 w-32 shrink-0 items-center gap-1 text-xs text-muted-foreground' },
       createElement(Codicon, { name: 'source-control', size: '0.85em' }),
-      createElement('span', { className: 'truncate' }, branch)
+      createElement(
+        'span',
+        {
+          className: cn('truncate', project.remote_url ? 'cursor-pointer hover:underline' : ''),
+          title: project.remote_url ? `Open ${branch} on the remote` : branch,
+          'data-branch-link': project.name,
+          onClick: event => {
+            event.stopPropagation()
+            onOpenBranch?.(project)
+          }
+        },
+        branch
+      )
     ),
 
     createElement(
@@ -1714,7 +1816,18 @@ function ProjectCard({ project, selected, onSelect, panel, panelError, cardError
         : null,
       project.is_dirty
         ? action('Commit', 'Commit the staged changes', false, () => onCardAction('commit', project.name))
-        : null
+        : null,
+      // A fresh session in the project's own folder. The web dashboard's
+      // "open in workspace" is the same idea; the desktop can do it
+      // directly, because the gateway takes the folder on session.create.
+      action(
+        'Chat',
+        project.path
+          ? `Open a new session in ${project.path}`
+          : 'This project has no known folder on the server',
+        !canOpenSession,
+        () => onCardAction('session', project.name)
+      )
     )
   )
 
@@ -1863,12 +1976,81 @@ function ProjectsPage() {
 
   // A card's Pull / Fetch / Commit. `message` is supplied by the commit form;
   // there is no prompt to answer, because the Electron renderer has none.
+  /**
+   * Open a fresh session whose working directory is the project's own
+   * folder. The gateway's session.create takes a cwd, and that RPC is the
+   * only way a plugin can aim a session at a directory: ctx.newChat() takes
+   * a profile, and the project scope is the app's own state.
+   */
+  const openSessionFor = async name => {
+    const project = (data?.projects ?? []).find(p => p.name === name)
+    if (!project) {
+      setCardError({ name, text: 'Project not found' })
+      return
+    }
+    if (!project.path) {
+      setCardError({ name, text: 'This project has no known folder on the server' })
+      return
+    }
+    if (typeof host?.request !== 'function' || typeof host?.openSession !== 'function') {
+      setCardError({ name, text: 'This desktop version cannot open a session from a plugin' })
+      return
+    }
+    setBusyPath(name)
+    try {
+      const created = await host.request('session.create', {
+        cwd: project.path,
+        // Without this flag the gateway may fall back to the profile's own
+        // workspace folder instead of the folder the client named.
+        cwd_explicit: true,
+        title: project.name
+      })
+      const storedId = created?.stored_session_id ?? created?.session_id ?? created?.id
+      if (!storedId) {
+        throw new Error('The gateway returned no session id')
+      }
+      await host.openSession(storedId)
+      setCardError(null)
+    } catch (err) {
+      setCardError({ name, text: errorText(err) })
+    } finally {
+      setBusyPath(null)
+    }
+  }
+
+  // The web card's name click opens the repository, and its branch chip
+  // opens that branch on the remote. The desktop does it through the
+  // Electron shell instead of window.open().
+  const onOpenRemote = async project => {
+    const url = normalizeRemoteUrl(project.remote_url)
+    if (!url) return
+    if (!(await openInBrowser(url))) {
+      setCardError({ name: project.name, text: 'Could not open the repository' })
+    }
+  }
+
+  const onOpenBranch = async project => {
+    const url = branchUrl(project.remote_url, project.current_branch)
+    if (!url) return
+    if (!(await openInBrowser(url))) {
+      setCardError({ name: project.name, text: 'Could not open the branch' })
+    }
+  }
+
   const onCardAction = async (action, name, message) => {
     if (busyPath) return
 
     if (action === 'commit' && !message) {
       setCommitFor(name)
       setCommitMessage('')
+      return
+    }
+
+    // A session is not a git operation: it creates a chat in the project's
+    // folder and navigates the app to it. Nothing about the working tree
+    // moves, so the list and the panel are left alone.
+    if (action === 'session') {
+      await openSessionFor(name)
       return
     }
 
@@ -2130,7 +2312,9 @@ function ProjectsPage() {
               panelError: selected === project.name ? panelError : null,
               cardError: cardError && cardError.name === project.name ? cardError.text : null,
               busyPath,
-              onCardAction
+              onCardAction,
+              onOpenRemote,
+              onOpenBranch
             })
           )
         )
@@ -2197,7 +2381,7 @@ const plugin = {
   register(ctx) {
     // The disposer runs on unload/disable, so the REST handle never leaks
     // into a re-enabled copy.
-    ctx.onDispose(bindApi(ctx.rest))
+    ctx.onDispose(bindDoors(ctx.rest, ctx.os?.openExternal))
 
     ctx.registerMany([
       {

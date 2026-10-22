@@ -173,6 +173,26 @@ export const useQuery = config => {
 }
 
 export const useQueryClient = () => G.client
+
+// The gateway door the plugin uses to start a session in a project's folder.
+// The harness records every call so a test can assert the cwd that was sent.
+export const host = {
+  request: async (method, params) => {
+    const log = (G.hostCalls = G.hostCalls || [])
+    log.push({ method: method, params: params })
+    if (method === 'session.create') {
+      // A scenario can make the gateway refuse, to prove a failed session
+      // create lands on the card that asked for it.
+      if (G.hostReject) throw new Error(G.hostReject)
+      return { stored_session_id: 'stored-test' }
+    }
+    return {}
+  },
+  openSession: async id => {
+    const log = (G.hostCalls = G.hostCalls || [])
+    log.push({ method: 'openSession', id: id })
+  }
+}
 `
 
 const SDK_URL = 'test:hermes-plugin-sdk-stub'
@@ -213,6 +233,9 @@ const PROJECTS = {
       last_commit_date: '2026-10-20T09:12:00Z',
       last_commit_message: 'chore: alpha housekeeping',
       name: 'alpha',
+      // The backend sends the folder the project lives in; the Chat button
+      // aims the new session at it.
+      path: '/repos/alpha',
       remote_url: 'git@github.com:tiboo00/alpha.git'
     },
     {
@@ -224,6 +247,7 @@ const PROJECTS = {
       last_commit_date: '2026-10-20T10:12:00Z',
       last_commit_message: 'feat: beta feature work',
       name: 'beta',
+      path: '/repos/beta',
       remote_url: 'git@github.com:tiboo00/beta.git'
     }
   ],
@@ -426,6 +450,9 @@ function responder(path, opts) {
 // '@hermes/plugin-sdk' while it is evaluated, and the stub captures the
 // globals at ITS evaluation time.
 globalThis.__SDK__ = { client, queries }
+// The same object the SDK stub closes over, so a scenario can read the calls
+// the plugin made to the gateway door.
+const G = globalThis.__SDK__
 
 const pluginSrc = readFileSync(PLUGIN_JS, 'utf8')
 const pluginUrl = 'data:text/javascript;base64,' + Buffer.from(pluginSrc).toString('base64')
@@ -436,7 +463,18 @@ const mod = await import(pluginUrl)
 // so nothing below reaches past the shipped surface.
 const contributions = []
 
+const externalCalls = []
+
 mod.default.register({
+  os: {
+    openExternal: url => {
+      externalCalls.push(url)
+      // The real door RESOLVES false when the shell cannot open the URL —
+      // it never throws. A scenario flips this to prove the refusal is
+      // reported on the card instead of passing for a success.
+      return Promise.resolve(!G.openExternalFails)
+    }
+  },
   onDispose: () => {},
   registerMany: items => contributions.push(...items),
   rest: (path, opts) => {
@@ -506,6 +544,12 @@ const text = () => container.textContent
 const byLabel = label => container.querySelector(`[aria-label="${label}"]`)
 const byText = (label, root = container) =>
   [...root.querySelectorAll('button')].find(button => button.textContent.trim() === label)
+// The repository link (the project NAME) and the branch link (the branch chip)
+// of a card. Both are spans, not buttons, so they are found by their
+// attribute — which carries the project they belong to.
+const remoteLink = name => container.querySelector(`[data-remote-link="${name}"]`)
+const branchLink = name => container.querySelector(`[data-branch-link="${name}"]`)
+const cardOf = name => container.querySelector(`[data-card="${name}"]`)
 
 // The Disclosure blocks (Branches / Recent commits / Worktrees & branches)
 // render their children only when open, so a section's contents are asserted
@@ -553,6 +597,12 @@ async function scenario(name, fn) {
   queries.length = 0
   stubs.clear()
   promptCalls = 0
+  // The gateway door and the shell door are per-scenario too, so a scenario
+  // only ever sees the calls IT made.
+  externalCalls.length = 0
+  G.hostCalls = []
+  G.hostReject = null
+  G.openExternalFails = false
 
   try {
     await fn()
@@ -1058,6 +1108,205 @@ await scenario('a Pull all failure summary is visible with no card selected', as
     container.querySelector('[data-notice]'),
     'the summary must reach the page-level notice channel'
   )
+})
+
+// ── K: the remote links (web-dashboard parity) ──────────────────────────────
+//
+// The web card turns the project NAME into the link to the repository and
+// the branch chip into the link to that branch on the remote. The desktop
+// does the same, through the Electron shell instead of window.open() — so the
+// URL the browser is handed is the NORMALIZED one: an SSH remote becomes
+// https, and the .git suffix goes.
+await scenario('K: the project name opens the repository URL', async () => {
+  await mount()
+
+  const link = remoteLink('alpha')
+
+  assert.ok(link, 'the project name is not a repository link')
+  assert.equal(link.textContent, 'alpha', 'the link does not show the project name')
+  assert.equal(
+    link.getAttribute('data-remote-link'),
+    'alpha',
+    'the link does not carry the project it belongs to'
+  )
+
+  await click(link)
+
+  assert.deepEqual(externalCalls, ['https://github.com/tiboo00/alpha'])
+})
+
+await scenario('K: the branch chip opens that branch on the remote', async () => {
+  await mount()
+
+  const chip = branchLink('alpha')
+
+  assert.ok(chip, 'the branch chip is not a link')
+  assert.equal(
+    chip.getAttribute('data-branch-link'),
+    'alpha',
+    'the branch link does not carry the project it belongs to'
+  )
+
+  await click(chip)
+
+  assert.deepEqual(externalCalls, ['https://github.com/tiboo00/alpha/tree/main'])
+
+  // A branch with a slash is url-encoded, so the remote URL stays a URL.
+  await click(branchLink('beta'))
+
+  assert.deepEqual(externalCalls[1], 'https://github.com/tiboo00/beta/tree/feat%2Fparity')
+})
+
+await scenario('K: clicking the project name does not select the card', async () => {
+  await mount()
+
+  assert.equal(container.querySelector('[data-detail]'), null, 'a card is selected before the click')
+  await click(remoteLink('alpha'))
+
+  // The card row is a role=button that selects the project. The name is a
+  // link INSIDE it, so the click must not bubble into a selection.
+  assert.equal(container.querySelector('[aria-expanded="true"]'), null, 'the name click expanded a card')
+  assert.equal(container.querySelector('[data-detail]'), null, 'the name click selected the card')
+  assert.deepEqual(externalCalls, ['https://github.com/tiboo00/alpha'], 'the name did not open the repository')
+})
+
+await scenario('K: a remote that is not http(s) is not a link', async () => {
+  stubs.set('GET /projects?page=1&page_size=21', {
+    ...PROJECTS,
+    projects: PROJECTS.projects.map(project =>
+      project.name === 'beta' ? { ...project, remote_url: 'file:///srv/git/beta' } : project
+    )
+  })
+
+  await mount()
+
+  await click(remoteLink('beta'))
+
+  assert.deepEqual(externalCalls, [], 'a remote that is not http(s) was opened in the browser')
+})
+
+await scenario('K: a shell that cannot open the URL says so on the card', async () => {
+  // The real door RESOLVES false when the Electron shell has no bridge for
+  // the URL; it never throws. A false that is read as a success leaves the
+  // user with a click that did nothing, so the refusal must be reported.
+  G.openExternalFails = true
+
+  await mount()
+
+  await click(remoteLink('alpha'))
+
+  const error = cardOf('alpha').querySelector('[data-card-error="alpha"]')
+
+  assert.ok(error, 'the failed open was silent; the card says nothing')
+  assert.ok(
+    error.textContent.includes('Could not open the repository'),
+    `the card does not say what failed: ${error.textContent}`
+  )
+  assert.equal(
+    cardOf('beta').querySelector('[data-card-error]'),
+    null,
+    'the failure leaked onto another card'
+  )
+})
+
+await scenario('K: a shell that cannot open the branch URL says so on the card', async () => {
+  G.openExternalFails = true
+
+  await mount()
+
+  await click(branchLink('alpha'))
+
+  const error = cardOf('alpha').querySelector('[data-card-error="alpha"]')
+
+  assert.ok(error, 'the failed open was silent; the card says nothing')
+  assert.ok(
+    error.textContent.includes('Could not open the branch'),
+    `the card does not say what failed: ${error.textContent}`
+  )
+})
+
+// ── L: the Chat button opens a session in the project's own folder ─────────
+//
+// The gateway's session.create is the only door a plugin has to aim a session
+// at a directory, so the card's Chat button has to name the folder (cwd),
+// say that the folder was named EXPLICITLY (cwd_explicit, or the gateway
+// falls back to the profile's workspace), and then open the session it got.
+await scenario('L: the Chat button opens a session in the project folder', async () => {
+  await mount()
+
+  const chat = byText('Chat', cardOf('alpha'))
+
+  assert.ok(chat, 'the card has no Chat button')
+  assert.equal(chat.textContent.trim(), 'Chat', 'the button label is not Chat')
+  assert.equal(chat.disabled, false, 'the Chat button is disabled on a project with a folder')
+
+  await click(chat)
+
+  const creates = G.hostCalls.filter(call => call.method === 'session.create')
+  const opens = G.hostCalls.filter(call => call.method === 'openSession')
+
+  assert.equal(creates.length, 1, `expected one session.create, got ${JSON.stringify(G.hostCalls)}`)
+  assert.deepEqual(
+    creates[0].params,
+    { cwd: '/repos/alpha', cwd_explicit: true, title: 'alpha' },
+    'the session was not created in the project folder'
+  )
+  assert.equal(opens.length, 1, `expected one openSession, got ${JSON.stringify(G.hostCalls)}`)
+  assert.equal(opens[0].id, 'stored-test', 'the created session was not the one opened')
+})
+
+await scenario('L: a refused session create lands on the card that asked for it', async () => {
+  G.hostReject = 'the gateway refused the session'
+
+  await mount()
+
+  await click(byText('Chat', cardOf('beta')))
+
+  const error = cardOf('beta').querySelector('[data-card-error="beta"]')
+
+  assert.ok(error, 'the refusal did not land on the card that asked for the session')
+  assert.ok(
+    error.textContent.includes('the gateway refused the session'),
+    `the refusal message is missing: ${error.textContent}`
+  )
+  assert.equal(
+    cardOf('alpha').querySelector('[data-card-error]'),
+    null,
+    'the refusal leaked onto another card'
+  )
+  assert.equal(
+    G.hostCalls.filter(call => call.method === 'openSession').length,
+    0,
+    'a refused session was opened anyway'
+  )
+})
+
+await scenario('L: a project with no known folder cannot start a session', async () => {
+  stubs.set('GET /projects?page=1&page_size=21', {
+    ...PROJECTS,
+    projects: PROJECTS.projects.map(project => {
+      if (project.name !== 'beta') return project
+      const { path, ...withoutPath } = project
+
+      return withoutPath
+    })
+  })
+
+  await mount()
+
+  const chat = byText('Chat', cardOf('beta'))
+
+  assert.ok(chat, 'the card has no Chat button')
+  assert.equal(chat.disabled, true, 'the Chat button is enabled for a project with no folder')
+  assert.match(
+    chat.getAttribute('title'),
+    /no known folder/,
+    'the button does not say why it is disabled'
+  )
+
+  await click(chat)
+
+  assert.deepEqual(G.hostCalls, [], 'a session was started for a project with no folder')
 })
 
 // ── report ──────────────────────────────────────────────────────────────────

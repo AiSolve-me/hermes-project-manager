@@ -183,6 +183,21 @@ export const useQuery = config => {
 }
 
 export const useQueryClient = () => G.client
+
+// The gateway door the plugin uses to start a session in a project's folder.
+// The harness records every call so a test can assert the cwd that was sent.
+export const host = {
+  request: async (method, params) => {
+    const log = (G.hostCalls = G.hostCalls || [])
+    log.push({ method: method, params: params })
+    if (method === 'session.create') return { stored_session_id: 'stored-test' }
+    return {}
+  },
+  openSession: async id => {
+    const log = (G.hostCalls = G.hostCalls || [])
+    log.push({ method: 'openSession', id: id })
+  }
+}
 `
 }
 
@@ -342,7 +357,15 @@ const contributions = []
 const disposers = []
 const restCalls = []
 
+const externalCalls = []
+
 mod.default.register({
+  os: {
+    openExternal: url => {
+      externalCalls.push(url)
+      return Promise.resolve(true)
+    }
+  },
   onDispose: fn => disposers.push(fn),
   registerMany: items => contributions.push(...items),
   rest: (path, opts) => {
