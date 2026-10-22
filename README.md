@@ -37,6 +37,10 @@ a `Projects` sidebar item — it speaks the same REST router.
   ask it to.
 - **Project list.** Branch, ahead/behind, dirty flag, remote URL, last commit and
   a Docker badge. Search and pagination (`page_size` is 9, 21 or 27).
+- **Desktop shortcuts.** On the Desktop surface the project name opens the
+  repository and the branch chip opens that branch on the remote; a **Chat**
+  button on each card starts a new session whose working directory is that
+  project's own folder.
 - **Working tree, per file.** Stage, unstage, view the diff, or discard — each
   on its own file, rather than staging the whole tree blind.
 - **Commit and push**, with an optional automatic push after the commit, plus
@@ -284,10 +288,17 @@ What this plugin touches on the machine it runs on. Nothing leaves the host.
 - Its own SQLite database (`project_scans`, `watch_paths`) and its in-memory
   scan cache. Nothing else on disk is written.
 
+- **A Desktop-only session.** The Chat button creates one gateway session whose
+  working directory is the project folder, and opens it. It creates an empty
+  session and sends no message; the agent in it has no more access than any
+  session you start in that folder yourself.
+
 **Network** — none. The plugin makes no outbound requests, calls no model and
 reads no API keys. `git fetch` / `git push` do reach the remote of the
 repository being operated on, but that is git's own transport, driven by your
-own remotes.
+own remotes. The Desktop surface hands a repository URL to your **system
+browser** when you click the project name or the branch chip — that is the
+browser's own request, and the plugin itself opens no connection.
 
 **Not implemented, on purpose** — no `commit-message-suggestion` (there is no
 model access here, and a `git diff --stat` stand-in would not match the shape
@@ -313,6 +324,8 @@ desktop/
   plugin.js               the Desktop page — ONE self-contained file
   plugin.single.mjs       loader-contract + render harness
   test_working_tree.mjs   behavioural harness (confirm gate, success:false, diff states)
+  test_parity.mjs         surface-parity harness (every card action, the worktree
+                          section, the watch-folder panel, the git link, the session)
   test_api_paths.py       routes, namespace, path anchoring
 docs/assets/              screenshots
 ```
@@ -324,8 +337,9 @@ docs/assets/              screenshots
 python3 -m pytest dashboard/test_git_*_endpoint.py dashboard/test_pull_stale_lock.py -q
 
 # desktop: renders the shipped plugin.js and drives its real handlers
-cd desktop && node plugin.single.mjs
-cd desktop && node test_working_tree.mjs
+cd desktop && node plugin.single.mjs          # 14 checks
+cd desktop && node test_working_tree.mjs      # 12 scenarios
+cd desktop && node test_parity.mjs            # 33 scenarios
 cd desktop && python3 test_api_paths.py
 
 # syntax gates for the two hand-written bundles
