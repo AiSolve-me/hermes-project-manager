@@ -145,7 +145,21 @@ export const relativeTime = (targetMs, nowMs = Date.now()) => {
 // globalThis.__SDK__ is read lazily — the stub module is evaluated while the
 // plugin module is imported, which is before the harness finishes wiring up.
 export const useQuery = config => {
-  globalThis.__SDK__.queries.push(config)
+  const log = globalThis.__SDK__.queries
+  // Bounded: the stub records every render's config, so a render loop
+  // would otherwise grow this array until the process is OOM-killed --
+  // which hides the assertion that should have failed.
+  log.push(config)
+  if (log.length > 200) log.shift()
+
+  // A render loop shows up here as the same query asked for over and over.
+  // Fail loudly with the key instead of letting the process eat 50 GB.
+  const loopKey = JSON.stringify(config.queryKey)
+  const counts = (globalThis.__SDK__.queryCounts = globalThis.__SDK__.queryCounts || {})
+  counts[loopKey] = (counts[loopKey] || 0) + 1
+  if (counts[loopKey] > 40) {
+    throw new Error('RENDER LOOP: query ' + loopKey + ' asked for ' + counts[loopKey] + ' times')
+  }
   const key = JSON.stringify(config.queryKey)
   const [result, setResult] = useState({ data: undefined, error: null, isPending: true, isFetching: false })
 
@@ -593,6 +607,9 @@ const results = []
 
 async function scenario(name, fn) {
   restLog.length = 0
+  // The render-loop guard counts per query key; the keys repeat across
+  // scenarios, so the counter is per scenario.
+  if (globalThis.__SDK__) globalThis.__SDK__.queryCounts = {}
   client.invalidations.length = 0
   queries.length = 0
   stubs.clear()
